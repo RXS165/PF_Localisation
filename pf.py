@@ -30,14 +30,14 @@ class PFLocaliser(PFLocaliserBase):
         self.last_odom_x = 0
         self.last_odom_y = 0
         self.last_odom_heading = 0
-        self.M = 250
+        self.M = 350
         self.norm_weights = [1/self.M for i in range(self.M)]
-        self.w_fast = 0
-        self.w_slow = 0
-        self.alpha_fast = 0.3
-        self.alpha_slow = 0.01
-        self.cluster_eps = 0.3
-        self.cluster_min_samples = 10
+        self.w_fast = 1 /self.M
+        self.w_slow = 1/self.M
+        self.alpha_fast = 0.4
+        self.alpha_slow = 0.02
+        self.cluster_eps = 0.05
+        self.cluster_min_samples = int(self.M*0.02)
     def initialise_particle_cloud(self, initialpose):
         """
         Set particle cloud to initialpose plus noise
@@ -57,7 +57,7 @@ class PFLocaliser(PFLocaliserBase):
         initialParticles = PoseArray()
         for i in range(self.M):
             #initialParticles.poses.append(self.getGaussianRandomPose(initialpose.pose.pose, 1))
-            initialParticles.poses.append(self.getUniformRandomPose())
+            initialParticles.poses.append(self.getUniformRandomPose(1))
         return initialParticles
     
     def update_particle_cloud(self, scan):
@@ -70,7 +70,6 @@ class PFLocaliser(PFLocaliserBase):
 
          """
         # systematic resampling 
-        
         if (self.prev_odom_x  != self.last_odom_x or self.prev_odom_y != self.last_odom_y  or self.prev_odom_heading != self.last_odom_heading):
             resampled_particles = PoseArray()
             weights = []
@@ -88,8 +87,9 @@ class PFLocaliser(PFLocaliserBase):
             avgWeight = w_total / self.M
             self.w_fast += self.alpha_fast * (avgWeight - self.w_fast)
             self.w_slow += self.alpha_slow * (avgWeight - self.w_slow)
+            rospy.loginfo("random_prob = " + str(1-(self.w_fast/self.w_slow)))
 
-            numRandoms = max(int(0.1*self.M), int(self.M*max(0, 1-(self.w_fast/self.w_slow))))
+            numRandoms = int(self.M*min(max(0.04, 1-(self.w_fast/self.w_slow)), 0.5))
             # numResamples = N - numRandoms
             #rospy.loginfo("avgWeight = " + str(avgWeight))
             #rospy.loginfo("prob = " + str(1-(self.w_fast/self.w_slow)))
@@ -120,9 +120,10 @@ class PFLocaliser(PFLocaliserBase):
 
             for n in range(numRandoms):
                 i = random.randint(0, self.M-1)
-                randomPose = self.getUniformRandomPose()
+                randomPose = self.getUniformRandomPose(1)
+                new_w = self.sensor_model.get_weight(scan, randomPose)
                 resampled_particles.poses[i] = randomPose
-                resampled_weights[i] = self.sensor_model.get_weight(scan, randomPose)
+                resampled_weights[i] = new_w
             resampled_w_total = sum(resampled_weights)
 
             self.norm_weights = [w / resampled_w_total for w in resampled_weights]
@@ -131,7 +132,8 @@ class PFLocaliser(PFLocaliserBase):
             self.last_odom_y = self.prev_odom_y
             self.last_odom_heading = self.prev_odom_heading
             self.particlecloud.poses = resampled_particles.poses
-        
+        #rospy.loginfo("resampling time = "+str((time()-start_time)*100)+"ms")
+
 
 
 
@@ -152,7 +154,7 @@ class PFLocaliser(PFLocaliserBase):
         :Return:
             | (geometry_msgs.msg.Pose) robot's estimated pose.
          """
-
+        #start_time = time()
         finalPose = Pose()
         clusterSpace = []
 
@@ -160,23 +162,28 @@ class PFLocaliser(PFLocaliserBase):
             clusterSpace.append((p.position.x, p.position.y))
 
         clustering = DBSCAN(eps=self.cluster_eps, min_samples=self.cluster_min_samples).fit(clusterSpace)
-        clusterSizes = {}
+        clusterScores = {}
 
-        for label in list(set(clustering.labels_)):
-            if label != -1:
-                if label in clusterSizes:
-                    clusterSizes[label] += 1
+        for i in range(len(clustering.labels_)):
+            if clustering.labels_[i] != -1:
+                if clustering.labels_[i] in clusterScores:
+                    clusterScores[clustering.labels_[i]] += self.norm_weights[i]
                 else:
-                    clusterSizes[label] = 1
+                    clusterScores[clustering.labels_[i]] = self.norm_weights[i]
 
-        num_clusters = len(clusterSizes.keys())
+        #rospy.loginfo(clusterScores)
+
+        num_clusters = len(clusterScores.keys())
 
         if(num_clusters == 0):
             return self.bestParticle()
 
         else:
-            best_cluster_label = max(clusterSizes, key=clusterSizes.get)
-            subGroupToUse = [self.particlecloud.poses[i] for i in range(self.M) if clustering.labels_[i] == best_cluster_label]
+            best_cluster_label = max(clusterScores, key=clusterScores.get)
+            weight_total = clusterScores[best_cluster_label]
+
+            #rospy.loginfo("best cluster: " + str(best_cluster_label))
+            subGroupToUse = [(self.particlecloud.poses[i], self.norm_weights[i]) for i in range(self.M) if clustering.labels_[i] == best_cluster_label]
             N = len(subGroupToUse)
 
             finalHeadingX = 0
@@ -189,8 +196,9 @@ class PFLocaliser(PFLocaliserBase):
 
             norm = 1/N
             for i in range(N):
-                p = subGroupToUse[i]
-                finalX += p.position.x * norm
+                p = subGroupToUse[i][0]
+                norm = subGroupToUse[i][1] / weight_total
+                finalX += p.position.x * norm 
                 finalY += p.position.y * norm
                 finalHeadingX += p.orientation.x * norm
                 finalHeadingY += p.orientation.y * norm
@@ -203,19 +211,20 @@ class PFLocaliser(PFLocaliserBase):
             finalPose.orientation.z = finalHeadingZ
             finalPose.orientation.w = finalHeadingW
 
+            #rospy.loginfo("pose estimating time = "+str((time()-start_time)*100)+"ms")
             return finalPose
     
-    def getUniformRandomPose(self):
+    def getUniformRandomPose(self, N):
         width = self.occupancy_map.info.width
-        height = self.occupancy_map.info.height
+        #height = self.occupancy_map.info.height
         resolution = self.occupancy_map.info.resolution
         origin_x = self.occupancy_map.info.origin.position.x
         origin_y = self.occupancy_map.info.origin.position.y
 
         n = 0
-        while n < 1:
-            rndX = random.uniform(0, width * resolution) + origin_x
-            rndY = random.uniform(0, height * resolution) + origin_y
+        while n < N:
+            rndX = random.uniform(-16, 16)
+            rndY = random.uniform(-16, 16)
 
             x_index = int((rndX-origin_x)/resolution)
             y_index = int((rndY-origin_y)/resolution)
